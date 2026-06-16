@@ -1,0 +1,98 @@
+# =============================================================================
+# recipe_processor config
+# =============================================================================
+
+# --- Files ---
+input_csv: "recipes.csv"           # Output from recipe_scraper.py
+output_csv: "recipes_processed.csv"
+
+# --- Family / scaling ---
+family_size: 4                     # Target servings for main meals
+# Meals classed as mains will be scaled to this number.
+# Desserts and snacks are left at their original yield.
+
+# --- Ollama ---
+ollama_base_url: "http://localhost:11434"
+ollama_model: "qwen2.5:7b"
+ollama_timeout: 300               # Seconds to wait for a response
+
+# --- Tagging ---
+
+# Ingredients to exclude from key ingredient tags unless they dominate the dish.
+# Add to this list freely — lowercase, no quantities.
+common_ingredients:
+  - onion
+  - onions
+  - garlic
+  - salt
+  - pepper
+  - black pepper
+  - white pepper
+  - olive oil
+  - vegetable oil
+  - sunflower oil
+  - butter
+  - water
+  - flour
+  - sugar
+  - plain flour
+  - self raising flour
+  - baking powder
+  - bicarbonate of soda
+  - baking soda
+  - vinegar
+  - stock
+  - cornflour
+  - cornstarch
+  - oil
+
+# Ingredients that don't scale linearly — processor will flag these with a warning.
+# Eggs are whole units; spices can overpower if doubled blindly etc.
+non_linear_ingredients:
+  - egg
+  - eggs
+  - yeast
+  - baking powder
+  - bicarbonate of soda
+  - baking soda
+  - chilli
+  - chilli flakes
+  - chili flakes
+  - cayenne
+  - paprika
+  - nutmeg
+  - cinnamon
+  - cloves
+  - star anise
+  - cardamom
+  - saffron
+  - fish sauce
+  - soy sauce
+  - miso
+  - salt
+
+# Valid meal type categories (used to validate/clean LLM output).
+# The LLM picks from these; add new ones as your meal planner grows.
+meal_types:
+  - main
+  - dessert
+  - snack
+  - breakfast
+
+# Valid seasons for tagging.
+seasons:
+  - Spring
+  - Summer
+  - Autumn
+  - Winter
+  - All
+
+# Hint phrases that strongly indicate cuisine type.
+# Helps the model when dish names are ambiguous.
+cuisine_hints:
+  chilli: ["Mexican", "Tex-Mex"]
+  curry: ["Indian", "South Asian"]
+  stir.fry: ["Chinese", "Asian"]
+  tagine: ["Moroccan", "North African"]
+  risotto: ["Italian"]
+  pasta: ["Italian"]
