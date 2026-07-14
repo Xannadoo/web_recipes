@@ -40,8 +40,13 @@ CSV_HEADERS = [
 # Browser / page fetching
 # ---------------------------------------------------------------------------
 
-def get_page_html(url: str) -> str:
-    """Fetch fully-rendered HTML using a headless Chrome browser."""
+def create_driver():
+    """
+    Create a headless Chrome driver. Caller is responsible for calling
+    driver.quit() when done. Reuse one driver across many page fetches
+    (e.g. in the crawler) to avoid the overhead of restarting the browser
+    for every URL.
+    """
     options = Options()
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
@@ -52,14 +57,27 @@ def get_page_html(url: str) -> str:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     )
-
     service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
+    return webdriver.Chrome(service=service, options=options)
 
+
+def fetch_html(driver, url: str, wait_seconds: float = 3) -> str:
+    """Navigate an existing driver to url and return the rendered HTML."""
+    driver.get(url)
+    time.sleep(wait_seconds)  # Allow JS to render; increase for slow sites
+    return driver.page_source
+
+
+def get_page_html(url: str) -> str:
+    """
+    Fetch fully-rendered HTML using a fresh headless Chrome browser.
+    Convenience wrapper for one-off single-URL use. For scraping many
+    URLs in a loop, use create_driver() + fetch_html() instead to reuse
+    the browser session.
+    """
+    driver = create_driver()
     try:
-        driver.get(url)
-        time.sleep(3)  # Allow JS to render; increase if needed for slow sites
-        return driver.page_source
+        return fetch_html(driver, url)
     finally:
         driver.quit()
 
@@ -236,9 +254,9 @@ def try_html_heuristics(soup: BeautifulSoup) -> dict:
 # CSV writing
 # ---------------------------------------------------------------------------
 
-def append_to_csv(recipe: dict, url: str) -> None:
-    file_exists = CSV_FILE.exists()
-    with CSV_FILE.open("a", newline="", encoding="utf-8") as f:
+def append_to_csv(recipe: dict, url: str, csv_path: Path = CSV_FILE) -> None:
+    file_exists = csv_path.exists()
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         if not file_exists:
             writer.writeheader()
@@ -247,38 +265,89 @@ def append_to_csv(recipe: dict, url: str) -> None:
             "source_url": url,
             "scraped_date": date.today().isoformat(),
         })
-    print(f"  ✓ Saved to {CSV_FILE.resolve()}")
+    print(f"  ✓ Saved to {csv_path.resolve()}")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def scrape_recipe(url: str) -> None:
-    print(f"\nFetching: {url}")
-    html = get_page_html(url)
+def extract_recipe(html: str) -> dict | None:
+    """
+    Parse rendered HTML and return a recipe dict (JSON-LD first, HTML
+    heuristics fallback), or None if nothing usable was found.
+    Used by both the single-URL CLI and the crawler.
+    """
     soup = BeautifulSoup(html, "html.parser")
 
-    print("  Trying JSON-LD schema...")
     recipe = try_json_ld(soup)
-
-    if recipe:
-        print("  ✓ Found structured recipe data (JSON-LD)")
-    else:
-        print("  ⚠ No JSON-LD schema found — falling back to HTML heuristics")
+    used_fallback = recipe is None
+    if used_fallback:
         recipe = try_html_heuristics(soup)
 
-    # Validate we got something useful
-    if not recipe.get("name") and not recipe.get("ingredients"):
-        print("  ✗ Could not extract recipe — page may require login or block scraping.")
-        return
+    if not recipe.get("name", "").strip() or not recipe.get("ingredients", "").strip():
+        return None
 
+    # Sanity check for the fallback path only: JSON-LD is structured data
+    # from the site itself, so it's trusted. HTML heuristics can misfire on
+    # pages that aren't actually individual recipes — e.g. a collection/
+    # category page's tag-cloud of filter keywords, where each character
+    # ends up in its own <span> and gets joined into a stream of single
+    # characters like "f | e | t | a | , | c | o | u | s". If most
+    # "ingredients" are one or two characters long, this isn't a real
+    # ingredient list — reject it rather than saving garbage.
+    if used_fallback and recipe.get("ingredients"):
+        items = [i for i in recipe["ingredients"].split(" | ") if i]
+        if items:
+            short_items = [i for i in items if len(i) <= 2]
+            if len(short_items) / len(items) > 0.5:
+                return None
+
+    recipe["_used_fallback"] = used_fallback
+    return recipe
+
+
+def scrape_recipe(url: str, driver=None, csv_path: Path = CSV_FILE) -> dict | None:
+    """
+    Scrape a single recipe URL and append it to csv_path.
+
+    Args:
+        url: Recipe page URL.
+        driver: An existing Selenium driver to reuse (e.g. from the crawler).
+                If None, a fresh one is created and closed for this call.
+        csv_path: Where to append the result.
+
+    Returns the recipe dict on success, None if extraction failed.
+    """
+    print(f"\nFetching: {url}")
+
+    owns_driver = driver is None
+    if owns_driver:
+        driver = create_driver()
+
+    try:
+        html = fetch_html(driver, url)
+    finally:
+        if owns_driver:
+            driver.quit()
+
+    print("  Trying JSON-LD schema...")
+    recipe = extract_recipe(html)
+
+    if recipe is None:
+        print("  ✗ Could not extract recipe — page may require login or block scraping.")
+        return None
+
+    print("  ✓ Found structured recipe data (JSON-LD)" if not recipe["_used_fallback"]
+          else "  ⚠ No JSON-LD schema found — used HTML heuristics")
     print(f"  Recipe: {recipe.get('name', '(unnamed)')}")
     print(f"  Servings: {recipe.get('servings', '-')}")
     print(f"  Prep: {recipe.get('prep_time', '-')}  Cook: {recipe.get('cook_time', '-')}")
     print(f"  Ingredients: {len(recipe.get('ingredients', '').split(' | '))} items")
 
-    append_to_csv(recipe, url)
+    recipe.pop("_used_fallback", None)
+    append_to_csv(recipe, url, csv_path)
+    return recipe
 
 
 if __name__ == "__main__":

@@ -1,18 +1,13 @@
 """
 recipe_processor.py
 ===================
-Reads recipes.csv (output of recipe_scraper.py), enriches each recipe with:
-  - Meal type detection (main / dessert / snack / etc.)
+Reads scraped recipes CSV, enriches each with:
+  - Meal type, key ingredient tags, cuisine tags, season tags (via Ollama)
   - Portion scaling to family_size for mains
-  - Scaling warnings for non-linear ingredients (spices, eggs, etc.)
-  - Key ingredient tags (notable ingredients, excluding common ones)
-  - Cuisine / dish type tags (Chinese, soup, bake, etc.)
-  - Season tags (Spring / Summer / Autumn / Winter / All)
+  - Scaling warnings for non-linear ingredients
+  - Ease score derived from prep/cook time (prep weighted more than cook)
 
-Skips recipes already present in the output CSV.
-Writes enriched rows to recipes_processed.csv.
-
-Tagging is done via a local Ollama model (default: qwen2.5:7b).
+Skips recipes already in the output CSV. Appends results to recipes_processed.csv.
 
 Usage:
     python recipe_processor.py
@@ -25,6 +20,7 @@ Dependencies:
 import argparse
 import csv
 import json
+import math
 import re
 import sys
 from fractions import Fraction
@@ -49,23 +45,17 @@ def load_config(path: Path) -> dict:
 # CSV helpers
 # ---------------------------------------------------------------------------
 
-INPUT_HEADERS = [
-    "name", "servings", "prep_time", "cook_time",
-    "ingredients", "method", "source_url", "scraped_date"
-]
-
 OUTPUT_HEADERS = [
     "name", "meal_type", "servings_original", "servings_scaled",
     "scale_factor", "scaling_warnings",
-    "prep_time", "cook_time",
+    "prep_time", "cook_time", "ease",
     "ingredients_original", "ingredients_scaled",
     "method", "source_url", "scraped_date",
     "tags_key_ingredients", "tags_cuisine", "tags_season",
 ]
 
 
-def load_processed_names(path: Path) -> set[str]:
-    """Return the set of source_urls already in the processed CSV."""
+def load_processed_urls(path: Path) -> set:
     if not path.exists():
         return set()
     with path.open(encoding="utf-8") as f:
@@ -73,7 +63,7 @@ def load_processed_names(path: Path) -> set[str]:
         return {row["source_url"] for row in reader if row.get("source_url")}
 
 
-def read_input_csv(path: Path) -> list[dict]:
+def read_input_csv(path: Path) -> list:
     if not path.exists():
         print(f"✗ Input file not found: {path}")
         sys.exit(1)
@@ -91,18 +81,64 @@ def append_output_csv(path: Path, row: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Ease score from prep + cook time
+# ---------------------------------------------------------------------------
+
+TIME_RE = re.compile(r"(?:(\d+)\s*h(?:r|ours?)?)?\s*(?:(\d+)\s*m(?:in(?:utes?)?)?)?", re.I)
+
+
+def parse_minutes(time_str: str) -> float | None:
+    """Parse a time string like '1h 30m', '45m', '2h' into total minutes."""
+    if not time_str or not time_str.strip():
+        return None
+    m = TIME_RE.search(time_str.strip())
+    if not m or not any(m.groups()):
+        return None
+    hours = int(m.group(1) or 0)
+    mins = int(m.group(2) or 0)
+    total = hours * 60 + mins
+    return float(total) if total > 0 else None
+
+
+def compute_ease(prep_str: str, cook_str: str, config: dict) -> float:
+    """
+    Derive an ease score (0.0 hard → 1.0 easy) from prep and cook time.
+    Prep is weighted more heavily than cook (active vs passive effort).
+    Returns fallback value if times are missing.
+    """
+    prep_w = config.get("ease_weights", {}).get("prep", 2.0)
+    cook_w = config.get("ease_weights", {}).get("cook", 0.5)
+    fallback = config.get("ease_fallback", 0.5)
+
+    prep_mins = parse_minutes(prep_str)
+    cook_mins = parse_minutes(cook_str)
+
+    if prep_mins is None and cook_mins is None:
+        return fallback
+
+    effort = ((prep_mins or 0) * prep_w) + ((cook_mins or 0) * cook_w)
+    # log scale: effort=0→log(2)≈0.69, effort=15→log(17)≈2.83, effort=240→log(242)≈5.49
+    # We invert so more effort = lower ease, normalised roughly to 0–1
+    # Using log(effort+2) mapped from [log(2), log(482)] → [1, 0]
+    log_val = math.log(effort + 2)
+    log_min = math.log(2)        # ~0 effort
+    log_max = math.log(482)      # ~240 min prep equivalent (4h)
+    ease = 1.0 - (log_val - log_min) / (log_max - log_min)
+    return round(max(0.0, min(1.0, ease)), 4)
+
+
+# ---------------------------------------------------------------------------
 # Ingredient scaling
 # ---------------------------------------------------------------------------
 
-# Matches patterns like:  200g  /  2 tbsp  /  1/2 cup  /  3  /  1½
 QUANTITY_RE = re.compile(
     r"""
     (?P<amount>
-        \d+\s+\d+/\d+       # mixed number:  1 1/2
-        | \d+/\d+            # fraction:       3/4
-        | \d*[.,]\d+         # decimal:        0.5 / 1,5
-        | [½⅓⅔¼¾⅛⅜⅝⅞]      # unicode fracs
-        | \d+                # whole number
+        \d+\s+\d+/\d+
+        | \d+/\d+
+        | \d*[.,]\d+
+        | [½⅓⅔¼¾⅛⅜⅝⅞]
+        | \d+
     )
     \s*
     (?P<unit>
@@ -136,67 +172,54 @@ UNICODE_FRACS = {
 }
 
 
-def parse_amount(text: str) -> float | None:
-    """Parse a matched amount string to a float."""
+def parse_amount(text: str) -> float:
     text = text.strip()
-    # Unicode fraction
     if text in UNICODE_FRACS:
         return UNICODE_FRACS[text]
-    # Mixed number: "1 1/2"
     if re.match(r"^\d+\s+\d+/\d+$", text):
         whole, frac = text.split()
         return int(whole) + float(Fraction(frac))
-    # Standard fraction
     if "/" in text:
         return float(Fraction(text))
-    # Decimal (handle comma as separator)
     return float(text.replace(",", "."))
 
 
 def format_amount(value: float) -> str:
-    """Return a clean string for a scaled amount."""
     if value == int(value):
         return str(int(value))
-    # Round to 2 dp, strip trailing zeros
     return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
 def scale_ingredient_line(line: str, factor: float) -> str:
-    """Scale all quantities in a single ingredient string."""
-    def replacer(m: re.Match) -> str:
-        amount_str = m.group("amount")
-        unit = m.group("unit") or ""
+    def replacer(m):
         try:
-            value = parse_amount(amount_str)
+            value = parse_amount(m.group("amount"))
         except (ValueError, ZeroDivisionError):
             return m.group(0)
+        unit = m.group("unit") or ""
         scaled = value * factor
         return f"{format_amount(scaled)}{' ' + unit if unit else ''}"
-
     return QUANTITY_RE.sub(replacer, line)
 
 
 def scale_ingredients(ingredients_str: str, factor: float) -> str:
-    """Scale all pipe-separated ingredient lines."""
     if factor == 1.0:
         return ingredients_str
-    lines = ingredients_str.split(" | ")
-    return " | ".join(scale_ingredient_line(line, factor) for line in lines)
+    return " | ".join(
+        scale_ingredient_line(line, factor)
+        for line in ingredients_str.split(" | ")
+    )
 
 
-def find_scaling_warnings(ingredients_str: str, non_linear: list[str]) -> list[str]:
-    """Return ingredient names that appear in the non-linear list."""
-    warnings = []
+def find_scaling_warnings(ingredients_str: str, non_linear: list) -> list:
     lower = ingredients_str.lower()
-    for item in non_linear:
-        # Match whole word
-        if re.search(rf"\b{re.escape(item)}\b", lower):
-            warnings.append(item)
-    return warnings
+    return [
+        item for item in non_linear
+        if re.search(rf"\b{re.escape(item)}\b", lower)
+    ]
 
 
 def parse_servings(servings_str: str) -> float | None:
-    """Extract the first number from a servings string like '4', '4-6', 'Serves 4'."""
     m = re.search(r"\d+", servings_str or "")
     return float(m.group()) if m else None
 
@@ -206,13 +229,14 @@ def parse_servings(servings_str: str) -> float | None:
 # ---------------------------------------------------------------------------
 
 PROMPT_TEMPLATE = """\
-You are a recipe tagging assistant. Analyse the recipe below and return ONLY a valid JSON object — no explanation, no markdown, no extra text.
+You are a recipe tagging assistant. Analyse the recipe below and return ONLY a valid JSON object.
+No explanation, no markdown fences, no extra text — just the raw JSON.
 
 Recipe name: {name}
 Ingredients: {ingredients}
-Method summary: {method_snippet}
+Method: {method_snippet}
 
-Return this exact JSON structure:
+Return exactly this JSON structure:
 {{
   "meal_type": "<one of: {meal_types}>",
   "key_ingredients": ["ingredient1", "ingredient2"],
@@ -221,20 +245,24 @@ Return this exact JSON structure:
 }}
 
 Rules:
-- meal_type: classify as one of the allowed values only.
-- key_ingredients: notable/distinctive ingredients only, ie main protein (tofu, egg, chicken, prawns), main carbohydrate (potato, pasta, rice). Exclude common basics like: {common_ingredients} unless they are a major part of the dish, eg onions in french onion soup. Exclude vegetables unless a main part of the dish, ie cauliflower in cauliflower cheese. Max 8 items. Lowercase, no quantities.
-- cuisine_tags: cuisine style AND dish format where relevant, e.g. ["Italian", "pasta"] or ["Chinese", "stir-fry"] or ["soup", "vegetarian"]. Max 6 items.
-- season: which seasons this dish suits best. Use "All" if it works year-round.
+- meal_type: must be one of the listed values. A chilli is a main. A brownie is a dessert.
+- key_ingredients: the distinctive, characterful ingredients in this dish. Do NOT include: {common_ingredients}. Max 8 items, lowercase, no quantities. Think: what makes this dish what it is?
+- Use categories for the key_ingredients, e.g. "chicken", "beef", "pork", "fish", "tofu", "cheese", "pasta", "rice", "potato", "beans", "lentils". Avoid overly specific terms like "macaroni", "mashed potato".
+- cuisine_tags: include BOTH the cuisine origin AND the dish format where relevant. Examples: ["Mexican", "chilli"] or ["Italian", "pasta", "vegetarian"] or ["British", "bake"]. Max 6 items.
+- season: which seasons suit this dish. A chilli or stew suits Autumn/Winter. A salad suits Spring/Summer. Use "All" only if it genuinely works year-round.
 """
 
 
 def call_ollama(prompt: str, config: dict) -> str:
-    """Send a prompt to Ollama and return the raw text response."""
     url = f"{config['ollama_base_url']}/api/generate"
     payload = {
         "model": config["ollama_model"],
         "prompt": prompt,
         "stream": False,
+        "options": {
+            "num_ctx": 4096,      # Larger context window for 7b model
+            "temperature": 0.2,   # Low temp for consistent structured output
+        }
     }
     response = requests.post(url, json=payload, timeout=config["ollama_timeout"])
     response.raise_for_status()
@@ -242,7 +270,6 @@ def call_ollama(prompt: str, config: dict) -> str:
 
 
 def extract_json(text: str) -> dict | None:
-    """Pull the first JSON object out of a string (LLMs sometimes add preamble)."""
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         return None
@@ -253,23 +280,15 @@ def extract_json(text: str) -> dict | None:
 
 
 def validate_tags(raw: dict, config: dict) -> dict:
-    """Validate and clean LLM output against allowed values in config."""
     valid_meal_types = [m.lower() for m in config.get("meal_types", [])]
     valid_seasons = config.get("seasons", [])
 
     meal_type = (raw.get("meal_type") or "").lower().strip()
     if meal_type not in valid_meal_types:
-        meal_type = "main"  # safe default
+        meal_type = "main"
 
-    key_ingredients = [
-        str(i).lower().strip()
-        for i in (raw.get("key_ingredients") or [])
-    ][:8]
-
-    cuisine_tags = [
-        str(t).strip()
-        for t in (raw.get("cuisine_tags") or [])
-    ][:6]
+    key_ingredients = [str(i).lower().strip() for i in (raw.get("key_ingredients") or [])][:8]
+    cuisine_tags = [str(t).strip() for t in (raw.get("cuisine_tags") or [])][:6]
 
     raw_seasons = raw.get("season") or ["All"]
     if isinstance(raw_seasons, str):
@@ -285,11 +304,7 @@ def validate_tags(raw: dict, config: dict) -> dict:
 
 
 def tag_recipe(recipe: dict, config: dict) -> dict:
-    """Call Ollama to tag a recipe. Returns validated tag dict."""
-    # Truncate method to keep prompt short for small models
-    method_snippet = (recipe.get("method") or "")[:2000]
-    print(f"{len((recipe.get('method') or ''))}, {len(method_snippet)}")
-
+    method_snippet = (recipe.get("method") or "")[:1500]
     prompt = PROMPT_TEMPLATE.format(
         name=recipe.get("name", ""),
         ingredients=recipe.get("ingredients", ""),
@@ -298,16 +313,15 @@ def tag_recipe(recipe: dict, config: dict) -> dict:
         seasons=", ".join(config.get("seasons", [])),
         common_ingredients=", ".join(config.get("common_ingredients", [])),
     )
-
     try:
         raw_text = call_ollama(prompt, config)
         raw_json = extract_json(raw_text)
         if raw_json is None:
-            print(f"    ⚠ Could not parse JSON from model response. Raw: {raw_text[:200]}")
+            print(f"    ⚠ Could not parse JSON from model. Raw: {raw_text[:300]}")
             return _empty_tags()
         return validate_tags(raw_json, config)
     except requests.exceptions.ConnectionError:
-        print("    ✗ Could not connect to Ollama. Is it running? (ollama serve)")
+        print("    ✗ Cannot connect to Ollama. Is it running? (ollama serve)")
         return _empty_tags()
     except Exception as e:
         print(f"    ✗ Tagging error: {e}")
@@ -315,12 +329,7 @@ def tag_recipe(recipe: dict, config: dict) -> dict:
 
 
 def _empty_tags() -> dict:
-    return {
-        "meal_type": "",
-        "key_ingredients": [],
-        "cuisine_tags": [],
-        "season": [],
-    }
+    return {"meal_type": "", "key_ingredients": [], "cuisine_tags": [], "season": []}
 
 
 # ---------------------------------------------------------------------------
@@ -328,37 +337,29 @@ def _empty_tags() -> dict:
 # ---------------------------------------------------------------------------
 
 def process_recipe(recipe: dict, config: dict) -> dict:
-    """Enrich a single recipe row and return the output row."""
     family_size = config.get("family_size", 4)
     non_linear = [i.lower() for i in config.get("non_linear_ingredients", [])]
 
-    # --- Tagging via Ollama ---
     print("    Tagging via Ollama...")
     tags = tag_recipe(recipe, config)
     meal_type = tags["meal_type"]
 
-    # --- Portion scaling (mains only) ---
+    # Ease from time
+    ease = compute_ease(recipe.get("prep_time", ""), recipe.get("cook_time", ""), config)
+
+    # Scaling — mains only
     servings_original_str = recipe.get("servings", "").strip()
     servings_original = parse_servings(servings_original_str)
-
     if meal_type == "main" and servings_original and servings_original > 0:
         scale_factor = family_size / servings_original
     else:
         scale_factor = 1.0
 
-    servings_scaled = (
-        int(round(servings_original * scale_factor))
-        if servings_original else ""
-    )
-
+    servings_scaled = int(round(servings_original * scale_factor)) if servings_original else ""
     ingredients_original = recipe.get("ingredients", "")
     ingredients_scaled = scale_ingredients(ingredients_original, scale_factor)
 
-    # --- Scaling warnings ---
-    if scale_factor != 1.0:
-        warnings = find_scaling_warnings(ingredients_original, non_linear)
-    else:
-        warnings = []
+    warnings = find_scaling_warnings(ingredients_original, non_linear) if scale_factor != 1.0 else []
 
     return {
         "name": recipe.get("name", ""),
@@ -369,6 +370,7 @@ def process_recipe(recipe: dict, config: dict) -> dict:
         "scaling_warnings": " | ".join(warnings),
         "prep_time": recipe.get("prep_time", ""),
         "cook_time": recipe.get("cook_time", ""),
+        "ease": ease,
         "ingredients_original": ingredients_original,
         "ingredients_scaled": ingredients_scaled,
         "method": recipe.get("method", ""),
@@ -386,9 +388,11 @@ def process_recipe(recipe: dict, config: dict) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Process and tag scraped recipes.")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument(
-        "--config", type=Path, default=DEFAULT_CONFIG,
-        help="Path to config.yaml (default: ./config.yaml)"
+        "--all", action="store_true",
+        help="Force reprocessing of all recipes, ignoring what's already in the "
+             "output CSV. This overwrites the output file from scratch."
     )
     args = parser.parse_args()
 
@@ -397,21 +401,23 @@ def main() -> None:
         sys.exit(1)
 
     config = load_config(args.config)
+    input_path = Path(config["scraped_csv"])
+    output_path = Path(config["processed_csv"])
 
-    input_path = Path(config["input_csv"])
-    output_path = Path(config["output_csv"])
+    if args.all and output_path.exists():
+        output_path.unlink()
+        print(f"--all set: cleared {output_path} — reprocessing everything.\n")
 
-    print(f"Reading recipes from:    {input_path.resolve()}")
-    print(f"Writing processed to:    {output_path.resolve()}")
-    print(f"Model:                   {config['ollama_model']}")
-    print(f"Target family size:      {config['family_size']}\n")
+    print(f"Reading from:   {input_path.resolve()}")
+    print(f"Writing to:     {output_path.resolve()}")
+    print(f"Model:          {config['ollama_model']}")
+    print(f"Family size:    {config['family_size']}\n")
 
     recipes = read_input_csv(input_path)
-    already_done = load_processed_names(output_path)
-
+    already_done = load_processed_urls(output_path)
     to_process = [r for r in recipes if r.get("source_url") not in already_done]
-    skipped = len(recipes) - len(to_process)
 
+    skipped = len(recipes) - len(to_process)
     if skipped:
         print(f"Skipping {skipped} already-processed recipe(s).\n")
     if not to_process:
@@ -419,16 +425,14 @@ def main() -> None:
         return
 
     print(f"Processing {len(to_process)} recipe(s)...\n")
-
     for i, recipe in enumerate(to_process, 1):
         name = recipe.get("name") or recipe.get("source_url") or f"Row {i}"
         print(f"[{i}/{len(to_process)}] {name}")
         try:
             row = process_recipe(recipe, config)
             append_output_csv(output_path, row)
-            print(f"    ✓ Done — meal_type: {row['meal_type']}, "
-                  f"scale: {row['scale_factor']}x, "
-                  f"seasons: {row['tags_season']}")
+            print(f"    ✓ meal_type={row['meal_type']}  ease={row['ease']}  "
+                  f"scale={row['scale_factor']}x  seasons={row['tags_season']}")
             if row["scaling_warnings"]:
                 print(f"    ⚠ Scaling warnings: {row['scaling_warnings']}")
         except Exception as e:

@@ -1,25 +1,137 @@
 # =============================================================================
-# recipe_processor config
+# Meal Planner + Recipe Processor — shared config
 # =============================================================================
 
 # --- Files ---
-input_csv: "recipes.csv"           # Output from recipe_scraper.py
-output_csv: "recipes_processed.csv"
+scraped_csv: "recipes.csv"              # Output from recipe_scraper.py
+processed_csv: "recipes_processed.csv"  # Output from recipe_processor.py
+planner_csv: "planner.csv"             # Personal data: ratings, last_made, ease
 
-# --- Family / scaling ---
-family_size: 4                     # Target servings for main meals
-# Meals classed as mains will be scaled to this number.
-# Desserts and snacks are left at their original yield.
+# --- Mode ---
+# "local"  — uses last_made dates and per-person ratings in scoring
+# "web"    — ignores last_made/ratings; uses jitter for variety
+mode: "web"
+
+# --- Family ---
+family_size: 4          # Target servings for mains (scaling)
+family_members: 4       # Number of person_N_rating columns in planner.csv
+
+# --- Planner ---
+meals_per_week: 7
+tag_penalty: 0.4        # How much to reduce score per shared tag (0.0–1.0)
+                        # Applied independently to key_ingredients, cuisine, season
+
+# Scoring weights — must sum to 1.0
+# In web mode, recency weight is redistributed to jitter instead
+score_weights:
+  season:   0.25
+  rating:   0.30
+  ease:     0.20
+  recency:  0.25        # Ignored in web mode; replaced by jitter
+
+# Jitter: small random noise added in web mode (or on top in local mode)
+# Prevents identical outputs on repeated runs with same data
+jitter_strength: 0.05   # Fraction of max score to use as noise range
+
+# Ease calculation from prep/cook time
+# effort_minutes = (prep_minutes * prep_weight) + (cook_minutes * cook_weight)
+# ease = 1 - normalised(log(effort_minutes + 2))
+ease_weights:
+  prep: 2.0             # Active effort counts double
+  cook: 0.5             # Passive oven/simmer time counts half
+ease_fallback: 0.5      # Used when prep/cook time is missing (0.0=hard, 1.0=easy)
+
+# --- Crawler ---
+crawler:
+  target_total_recipes: 100     # Stop once recipes.csv reaches this many rows.
+                                 # Bump to ~500 once you're happy with quality.
+  request_delay_seconds: 2       # Politeness delay between page fetches
+  name_similarity_threshold: 0.85  # Skip a find if its name is this similar (0-1)
+                                    # to one already collected (avoids near-duplicates
+                                    # like "Spaghetti Bolognese" vs "Easy Spag Bol")
+  max_attempts_multiplier: 4     # Give up after (target * this) candidate pages tried,
+                                  # in case a site runs out of unique/matching recipes
+  max_category_pages: 40         # Safety cap on paginating a single category listing
+
+# Keywords checked against a candidate URL/name before ever fetching the page —
+# a cheap first pass to skip obvious non-mains without wasting a page load.
+# Ingredient-based checks (below, per-site) act as the real safety net after fetch.
+dessert_snack_keywords:
+  - cake
+  - cookie
+  - biscuit
+  - dessert
+  - pudding
+  - brownie
+  - traybake
+  - cupcake
+  - muffin
+  - tart
+  - flapjack
+  - shortbread
+  - ice-cream
+  - trifle
+  - meringue
+
+# Ingredients that indicate a recipe is NOT vegetarian.
+# Used as a safety net after fetching, alongside each site's vegetarian category.
+non_vegetarian_keywords:
+  - chicken
+  - beef
+  - pork
+  - bacon
+  - lamb
+  - fish
+  - salmon
+  - cod
+  - haddock
+  - prawn
+  - shrimp
+  - sausage
+  - ham
+  - turkey
+  - anchovy
+  - tuna
+  - mince
+  - chorizo
+  - gelatine
+  - gelatin
+  - lard
+  - suet
+
+# Sites the crawler knows how to discover recipes from.
+# Add more entries here to extend to new sites later.
+sites:
+  - name: "BBC Food"
+    base_url: "https://www.bbc.co.uk"
+    sitemap_url: "https://www.bbc.co.uk/food/sitemap.xml"  # unconfirmed — verify this exists before relying on it
+    recipe_url_contains: "/food/recipes/"
+    # Segments that mean a link is NOT an individual recipe page, even though
+    # it contains "/food/recipes/" — collection/category pages link to other
+    # collections, and without this exclusion the crawler will wander into
+    # them and try to scrape a listing page as if it were a recipe.
+    non_recipe_url_segments:
+      - "/collections/"
+      - "/chefs/"
+      - "/programmes/"
+      - "/articles/"
+      - "/occasions/"
+      - "/cuisines/"
+      - "/diets/"
+    category_urls:
+      main: "https://www.bbc.co.uk/food/collections/vegetarian_family_dinner_ideas"
+      vegetarian: "https://www.bbc.co.uk/food/collections/veggie_family_favourites"
 
 # --- Ollama ---
-ollama_base_url: "http://localhost:11434"
+
+ollama_base_url: "http://192.168.0.208:11434"  # Ollama running on another machine on the network
 ollama_model: "qwen2.5:7b"
-ollama_timeout: 300               # Seconds to wait for a response
+ollama_timeout: 300
 
 # --- Tagging ---
 
-# Ingredients to exclude from key ingredient tags unless they dominate the dish.
-# Add to this list freely — lowercase, no quantities.
+# Ingredients to exclude from key ingredient tags.
+# Add freely — lowercase, no quantities.
 common_ingredients:
   - onion
   - onions
@@ -45,9 +157,9 @@ common_ingredients:
   - cornflour
   - cornstarch
   - oil
+  - seasoning
 
-# Ingredients that don't scale linearly — processor will flag these with a warning.
-# Eggs are whole units; spices can overpower if doubled blindly etc.
+# Ingredients that don't scale linearly — flagged with a warning on scaling.
 non_linear_ingredients:
   - egg
   - eggs
@@ -71,13 +183,16 @@ non_linear_ingredients:
   - miso
   - salt
 
-# Valid meal type categories (used to validate/clean LLM output).
-# The LLM picks from these; add new ones as your meal planner grows.
+# Valid meal type categories.
 meal_types:
   - main
   - dessert
   - snack
+  - starter
   - breakfast
+  - side
+  - sauce
+  - drink
 
 # Valid seasons for tagging.
 seasons:
@@ -86,13 +201,3 @@ seasons:
   - Autumn
   - Winter
   - All
-
-# Hint phrases that strongly indicate cuisine type.
-# Helps the model when dish names are ambiguous.
-cuisine_hints:
-  chilli: ["Mexican", "Tex-Mex"]
-  curry: ["Indian", "South Asian"]
-  stir.fry: ["Chinese", "Asian"]
-  tagine: ["Moroccan", "North African"]
-  risotto: ["Italian"]
-  pasta: ["Italian"]
