@@ -31,7 +31,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 CSV_FILE = Path("recipes.csv")
 CSV_HEADERS = [
-    "name", "servings", "prep_time", "cook_time",
+    "name", "servings", "prep_time", "cook_time", "total_time",
     "ingredients", "method", "source_url", "scraped_date"
 ]
 
@@ -102,12 +102,26 @@ def parse_duration(iso: str) -> str:
     return " ".join(parts) if parts else iso
 
 
+def clean_html_text(raw) -> str:
+    """
+    Strip any embedded HTML tags/entities from a text value and collapse
+    whitespace/newlines to single spaces. Some sites (e.g. HelloFresh) embed
+    raw HTML like '<p>a) Preheat...</p>' inside JSON-LD text fields instead
+    of plain text — without this, tags and multi-line formatting leak
+    straight into the CSV.
+    """
+    if not raw:
+        return ""
+    text = BeautifulSoup(str(raw), "html.parser").get_text(separator=" ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def extract_text(value) -> str:
     """Safely pull a string from a schema value that may be str or dict."""
     if isinstance(value, str):
-        return value.strip()
+        return clean_html_text(value)
     if isinstance(value, dict):
-        return value.get("text", "").strip()
+        return clean_html_text(value.get("text", ""))
     return ""
 
 
@@ -143,19 +157,22 @@ def try_json_ld(soup: BeautifulSoup) -> dict | None:
             )
 
             # Method: recipeInstructions can be a string, list of strings,
-            # or list of HowToStep objects
+            # or list of HowToStep objects. Some sites embed raw HTML
+            # inside the text — clean_html_text strips tags/entities.
             raw_steps = obj.get("recipeInstructions", [])
             if isinstance(raw_steps, str):
-                method = raw_steps.strip()
+                method = clean_html_text(raw_steps)
             else:
                 steps = []
                 for step in raw_steps:
                     if isinstance(step, str):
-                        steps.append(step.strip())
+                        text = clean_html_text(step)
                     elif isinstance(step, dict):
-                        text = step.get("text", "") or step.get("name", "")
-                        if text:
-                            steps.append(text.strip())
+                        text = clean_html_text(step.get("text", "") or step.get("name", ""))
+                    else:
+                        text = ""
+                    if text:
+                        steps.append(text)
                 method = " | ".join(steps)
 
             # Servings
@@ -169,6 +186,10 @@ def try_json_ld(soup: BeautifulSoup) -> dict | None:
                 "servings": servings,
                 "prep_time": parse_duration(obj.get("prepTime", "")),
                 "cook_time": parse_duration(obj.get("cookTime", "")),
+                # Some sites (e.g. HelloFresh) only give a combined total
+                # time rather than separate prep/cook — kept as its own
+                # field so ease scoring can use it as a fallback signal.
+                "total_time": parse_duration(obj.get("totalTime", "")),
                 "ingredients": ingredients,
                 "method": method,
             }
@@ -232,12 +253,15 @@ def try_html_heuristics(soup: BeautifulSoup) -> dict:
         servings = clean_text(servings_tag.get_text())
 
     # Times
-    prep_time, cook_time = "", ""
+    prep_time, cook_time, total_time = "", "", ""
     for tag in soup.find_all(class_=re.compile(r"prep.?time|preptime", re.I)):
         prep_time = clean_text(tag.get_text())
         break
     for tag in soup.find_all(class_=re.compile(r"cook.?time|cooktime", re.I)):
         cook_time = clean_text(tag.get_text())
+        break
+    for tag in soup.find_all(class_=re.compile(r"total.?time|totaltime", re.I)):
+        total_time = clean_text(tag.get_text())
         break
 
     return {
@@ -245,6 +269,7 @@ def try_html_heuristics(soup: BeautifulSoup) -> dict:
         "servings": servings,
         "prep_time": prep_time,
         "cook_time": cook_time,
+        "total_time": total_time,
         "ingredients": ingredients,
         "method": method,
     }
@@ -342,7 +367,7 @@ def scrape_recipe(url: str, driver=None, csv_path: Path = CSV_FILE) -> dict | No
           else "  ⚠ No JSON-LD schema found — used HTML heuristics")
     print(f"  Recipe: {recipe.get('name', '(unnamed)')}")
     print(f"  Servings: {recipe.get('servings', '-')}")
-    print(f"  Prep: {recipe.get('prep_time', '-')}  Cook: {recipe.get('cook_time', '-')}")
+    print(f"  Prep: {recipe.get('prep_time', '-')}  Cook: {recipe.get('cook_time', '-')}  Total: {recipe.get('total_time', '-')}")
     print(f"  Ingredients: {len(recipe.get('ingredients', '').split(' | '))} items")
 
     recipe.pop("_used_fallback", None)

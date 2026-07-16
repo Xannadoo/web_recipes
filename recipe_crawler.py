@@ -125,12 +125,18 @@ SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
 def fetch_sitemap_urls(
     sitemap_url: str, recipe_url_contains: str, depth: int = 0,
-    non_recipe_segments: list = None,
+    non_recipe_segments: list = None, recipe_url_pattern: str = None,
 ) -> list:
     """
     Recursively fetch a sitemap (or sitemap index) and return all URLs
     matching recipe_url_contains. Plain requests — sitemaps are static XML,
     no browser rendering needed.
+
+    recipe_url_pattern: optional regex that a URL must match (via re.search)
+    to be kept. Needed on sites like HelloFresh where collection pages live
+    under the same path prefix as real recipes (both contain "/recipes/"),
+    so substring/segment exclusion alone can't tell them apart — but real
+    recipe URLs end in a distinctive ID suffix collections don't have.
     """
     non_recipe_segments = non_recipe_segments or []
     if depth > 2:  # safety limit on nested sitemap indexes
@@ -153,7 +159,10 @@ def fetch_sitemap_urls(
             sub_url = loc.text.strip()
             # Only descend into sitemaps that look recipe-related, to save time
             if any(hint in sub_url.lower() for hint in ("recipe", "post", "page")):
-                urls.extend(fetch_sitemap_urls(sub_url, recipe_url_contains, depth + 1, non_recipe_segments))
+                urls.extend(fetch_sitemap_urls(
+                    sub_url, recipe_url_contains, depth + 1,
+                    non_recipe_segments, recipe_url_pattern,
+                ))
         return urls
 
     # Regular sitemap — contains actual page URLs
@@ -162,6 +171,8 @@ def fetch_sitemap_urls(
         if recipe_url_contains not in page_url:
             continue
         if any(seg in page_url for seg in non_recipe_segments):
+            continue
+        if recipe_url_pattern and not re.search(recipe_url_pattern, page_url):
             continue
         urls.append(page_url)
 
@@ -175,6 +186,7 @@ def fetch_sitemap_urls(
 def fetch_category_urls(
     driver, category_url: str, base_url: str, recipe_url_contains: str,
     max_pages: int = 40, non_recipe_segments: list = None,
+    recipe_url_pattern: str = None,
 ) -> list:
     """
     Render a category/collection page and pull out recipe links, paginating
@@ -187,6 +199,12 @@ def fetch_category_urls(
     (e.g. a "Related collections" block linking to another category page).
     Without this, the crawler can wander into scraping collection pages as
     if they were individual recipes.
+
+    recipe_url_pattern: optional regex a URL must match (via re.search) to
+    be kept. Needed on sites where collection pages share the same path
+    prefix as real recipes (e.g. HelloFresh: both "/recipes/vegetarian-
+    recipes" and "/recipes/tikka-paneer-skewers-65ae7452..." contain
+    "/recipes/", but only the real recipe ends in a distinctive ID suffix).
     """
     non_recipe_segments = non_recipe_segments or []
     urls = []
@@ -207,6 +225,8 @@ def fetch_category_urls(
             if recipe_url_contains not in href:
                 continue
             if any(seg in href for seg in non_recipe_segments):
+                continue
+            if recipe_url_pattern and not re.search(recipe_url_pattern, href):
                 continue
             if href.rstrip("/") == category_url.rstrip("/"):
                 continue
@@ -270,6 +290,7 @@ def crawl_site(
     recipe_url_contains = site.get("recipe_url_contains", "/recipe")
     category_urls = site.get("category_urls", {})
     non_recipe_segments = site.get("non_recipe_url_segments", [])
+    recipe_url_pattern = site.get("recipe_url_pattern")
 
     print(f"\n=== {site_name} ===")
 
@@ -291,6 +312,7 @@ def crawl_site(
         candidates = fetch_category_urls(
             driver, target_category, base_url, recipe_url_contains,
             max_pages=max_pages, non_recipe_segments=non_recipe_segments,
+            recipe_url_pattern=recipe_url_pattern,
         )
         print(f"  Found {len(candidates)} candidate URLs.")
     else:
@@ -299,7 +321,8 @@ def crawl_site(
             print("No suitable category_urls configured — falling back to sitemap.")
             print("  (Mains-only filtering will rely on the dessert/snack keyword check.)")
             candidates = fetch_sitemap_urls(
-                sitemap_url, recipe_url_contains, non_recipe_segments=non_recipe_segments
+                sitemap_url, recipe_url_contains, non_recipe_segments=non_recipe_segments,
+                recipe_url_pattern=recipe_url_pattern,
             )
             print(f"  Found {len(candidates)} candidate URLs via sitemap.")
         else:

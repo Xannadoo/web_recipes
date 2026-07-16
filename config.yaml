@@ -33,13 +33,64 @@ score_weights:
 # Prevents identical outputs on repeated runs with same data
 jitter_strength: 0.05   # Fraction of max score to use as noise range
 
-# Ease calculation from prep/cook time
-# effort_minutes = (prep_minutes * prep_weight) + (cook_minutes * cook_weight)
-# ease = 1 - normalised(log(effort_minutes + 2))
+# Ease is derived from four signals: prep time, cook time, ingredient
+# count, and step count. Each is mapped through its own fixed curve below
+# (absolute thresholds — e.g. "20 min prep = quick" — regardless of what
+# else is in the recipe pool), then combined using ease_weights.
+#
+# Each curve is a list of [x, ease] anchor points, linearly interpolated
+# between them. ease is always 0.0 (hardest) to 1.0 (easiest). Values
+# outside the given range clamp to the nearest anchor's ease.
+ease_curves:
+  # Prep minutes: <20 quick, ~20-45 fairly normal, >45 a bigger job
+  prep_minutes:
+    - [0, 1.0]
+    - [20, 0.85]
+    - [45, 0.5]
+    - [90, 0.15]
+    - [180, 0.05]
+  # Cook minutes: mostly passive time, so the curve is gentler than prep
+  cook_minutes:
+    - [0, 1.0]
+    - [30, 0.85]
+    - [60, 0.6]
+    - [120, 0.3]
+    - [240, 0.15]
+  # Total minutes (prep + cook combined) — used only for sites that don't
+  # publish prep/cook separately, e.g. HelloFresh gives one figure like
+  # "20 mins". Thresholds are roughly prep + cook combined.
+  total_minutes:
+    - [0, 1.0]
+    - [25, 0.85]
+    - [50, 0.5]
+    - [90, 0.2]
+    - [150, 0.05]
+  # Number of ingredient lines
+  ingredient_count:
+    - [3, 1.0]
+    - [6, 0.85]
+    - [10, 0.55]
+    - [16, 0.25]
+    - [24, 0.1]
+  # Number of method steps (or sentences, if a recipe has no discrete steps)
+  step_count:
+    - [2, 1.0]
+    - [5, 0.85]
+    - [8, 0.55]
+    - [13, 0.25]
+    - [20, 0.1]
+
+# Weights combining the four curve outputs above into the final ease score.
+# Missing signals (e.g. no cook time given) are excluded from the average
+# rather than penalised, so weights don't need to sum to any fixed total.
 ease_weights:
-  prep: 2.0             # Active effort counts double
-  cook: 0.5             # Passive oven/simmer time counts half
-ease_fallback: 0.5      # Used when prep/cook time is missing (0.0=hard, 1.0=easy)
+  prep: 2.0             # Active effort counts most
+  cook: 0.5             # Passive oven/simmer time counts least
+  total: 2.0             # Used instead of prep+cook when only total time is given
+  ingredients: 1.0
+  steps: 1.0
+
+ease_fallback: 0.5      # Used only if a recipe has none of the four signals at all
 
 # --- Crawler ---
 crawler:
@@ -119,8 +170,34 @@ sites:
       - "/cuisines/"
       - "/diets/"
     category_urls:
-      main: "https://www.bbc.co.uk/food/collections/vegetarian_family_dinner_ideas"
+      main: "https://www.bbc.co.uk/food/collections/affordable_30-minute_meals_for_four"
       vegetarian: "https://www.bbc.co.uk/food/collections/veggie_family_favourites"
+
+  - name: "HelloFresh"
+    base_url: "https://www.hellofresh.co.uk"
+    sitemap_url: "https://www.hellofresh.co.uk/sitemap.xml"  # unconfirmed — verify this exists before relying on it
+    recipe_url_contains: "/recipes/"
+    # HelloFresh collection pages (e.g. /recipes/vegetarian-recipes) live
+    # under the exact same path prefix as real recipes, so segment exclusion
+    # can't tell them apart. Real recipe URLs end in a distinctive 24-char
+    # hex ID (e.g. "-65ae7452b1758b5c6f890350") that collection slugs never
+    # have — this pattern requires that suffix to be present.
+    recipe_url_pattern: "-[0-9a-f]{24}$"
+    # Segments that mean a link is NOT an individual recipe page, even though
+    # it contains "/food/recipes/" — collection/category pages link to other
+    # collections, and without this exclusion the crawler will wander into
+    # them and try to scrape a listing page as if it were a recipe.
+    non_recipe_url_segments:
+      - "/collections/"
+      - "/chefs/"
+      - "/programmes/"
+      - "/articles/"
+      - "/occasions/"
+      - "/cuisines/"
+      - "/diets/"
+    category_urls:
+      main: "https://www.hellofresh.co.uk/recipes/most-popular-recipes"
+      vegetarian: "https://www.hellofresh.co.uk/recipes/vegetarian-recipes"
 
 # --- Ollama ---
 
@@ -201,3 +278,9 @@ seasons:
   - Autumn
   - Winter
   - All
+
+diet_types:
+  - meat
+  - fish
+  - vegetarian
+  - vegan

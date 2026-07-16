@@ -1,2 +1,6 @@
 *.csv
 /__pycache__/*
+*ipynb
+
+#processed data
+!recipes_processed.csv

@@ -18,6 +18,7 @@ Usage:
     python meal_planner.py 5                  # override meal count
     python meal_planner.py --config my.yaml   # custom config path
     python meal_planner.py --debug            # verbose scoring output
+    python meal_planner.py --diet vegetarian vegan   # filter by diet type(s)
 
     # Update personal data after cooking:
     python meal_planner.py --made "Veggie Chilli"
@@ -105,15 +106,25 @@ def ensure_planner_row(planner: pd.DataFrame, name: str, n_people: int) -> pd.Da
 # Data loading + merging
 # ---------------------------------------------------------------------------
 
-def load_and_merge(config: dict) -> pd.DataFrame:
+def load_and_merge(
+    config: dict, diet_types: Optional[list] = None, use_planner: bool = True
+) -> pd.DataFrame:
     """
-    Load recipes_processed.csv and planner.csv, merge on name,
-    and compute all scoring components.
+    Load recipes_processed.csv, optionally merge with planner.csv, and
+    compute all scoring components.
+
+    diet_types: optional list of allowed values from tags_diet
+    (e.g. ["vegetarian", "vegan"]). If provided, only recipes matching one
+    of these are included. None or an empty list means no filtering.
+
+    use_planner: when False, skips reading/writing planner.csv entirely and
+    forces web-mode scoring (neutral rating/recency). Use this for a public
+    deployment — it guarantees no personal data is read or written, and
+    avoids multiple visitors triggering concurrent writes to a shared file.
     """
     processed_path = Path(config["processed_csv"])
-    planner_path = Path(config["planner_csv"])
     n_people = config.get("family_members", 4)
-    mode = config.get("mode", "local")
+    mode = config.get("mode", "local") if use_planner else "web"
 
     if not processed_path.exists():
         print(f"✗ Processed recipes not found: {processed_path}")
@@ -124,19 +135,32 @@ def load_and_merge(config: dict) -> pd.DataFrame:
 
     # Only plan mains for now (could make meal_type filter configurable later)
     mains = processed[processed["meal_type"] == "main"].copy()
+
+    if diet_types:
+        allowed = {d.lower().strip() for d in diet_types}
+        if "tags_diet" not in mains.columns:
+            print("  ⚠ 'tags_diet' column not found in processed recipes — "
+                  "diet filter ignored. Re-run recipe_processor.py to populate it.")
+        else:
+            def matches_diet(value) -> bool:
+                parts = split_pipe(value)  # handles NaN/empty safely, lowercases
+                return bool(set(parts) & allowed)
+            mains = mains[mains["tags_diet"].apply(matches_diet)]
+
     if mains.empty:
-        print("✗ No main meals found in processed recipes.")
+        print("✗ No main meals found matching the given filters.")
         sys.exit(1)
 
-    planner = load_planner(planner_path, n_people)
-
-    # Ensure every main has a planner row
-    for name in mains["name"]:
-        planner = ensure_planner_row(planner, name, n_people)
-    save_planner(planner, planner_path)
-
-    # Merge
-    df = mains.merge(planner, on="name", how="left")
+    if use_planner:
+        planner_path = Path(config["planner_csv"])
+        planner = load_planner(planner_path, n_people)
+        # Ensure every main has a planner row
+        for name in mains["name"]:
+            planner = ensure_planner_row(planner, name, n_people)
+        save_planner(planner, planner_path)
+        df = mains.merge(planner, on="name", how="left")
+    else:
+        df = mains.copy()
 
     # --- Season score ---
     season = current_season()
@@ -417,6 +441,11 @@ def main() -> None:
     parser.add_argument("--rate", metavar="MEAL", help="Rate a meal")
     parser.add_argument("--person", type=int, metavar="N", help="Person number for --rate")
     parser.add_argument("--score", type=float, metavar="1-5", help="Rating score for --rate")
+    parser.add_argument(
+        "--diet", nargs="+", metavar="TYPE",
+        help="Filter to one or more diet types (meat, fish, vegetarian, vegan). "
+             "Omit to include all."
+    )
     args = parser.parse_args()
 
     if not args.config.exists():
@@ -444,9 +473,12 @@ def main() -> None:
 
     print(f"\nMode:    {mode}")
     print(f"Season:  {current_season()}")
-    print(f"Meals:   {args.n or config.get('meals_per_week', 7)}\n")
+    print(f"Meals:   {args.n or config.get('meals_per_week', 7)}")
+    if args.diet:
+        print(f"Diet:    {', '.join(args.diet)}")
+    print()
 
-    df = load_and_merge(config)
+    df = load_and_merge(config, diet_types=args.diet)
 
     meals = get_meals(
         df,

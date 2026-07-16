@@ -20,7 +20,6 @@ Dependencies:
 import argparse
 import csv
 import json
-import math
 import re
 import sys
 from fractions import Fraction
@@ -48,10 +47,10 @@ def load_config(path: Path) -> dict:
 OUTPUT_HEADERS = [
     "name", "meal_type", "servings_original", "servings_scaled",
     "scale_factor", "scaling_warnings",
-    "prep_time", "cook_time", "ease",
+    "prep_time", "cook_time", "total_time", "ease",
     "ingredients_original", "ingredients_scaled",
     "method", "source_url", "scraped_date",
-    "tags_key_ingredients", "tags_cuisine", "tags_season",
+    "tags_key_ingredients", "tags_cuisine", "tags_season", "tags_diet"
 ]
 
 
@@ -100,31 +99,131 @@ def parse_minutes(time_str: str) -> float | None:
     return float(total) if total > 0 else None
 
 
-def compute_ease(prep_str: str, cook_str: str, config: dict) -> float:
+def count_ingredients(ingredients_str: str) -> int:
+    """Count pipe-separated ingredient lines."""
+    if not ingredients_str or not ingredients_str.strip():
+        return 0
+    return len([i for i in ingredients_str.split("|") if i.strip()])
+
+
+def count_steps(method_str: str) -> int:
     """
-    Derive an ease score (0.0 hard → 1.0 easy) from prep and cook time.
-    Prep is weighted more heavily than cook (active vs passive effort).
-    Returns fallback value if times are missing.
+    Count method steps. Most scraped recipes have pipe-separated steps from
+    JSON-LD's recipeInstructions list. If a site gives one big paragraph
+    instead (no pipes), fall back to counting sentences as an approximation.
     """
-    prep_w = config.get("ease_weights", {}).get("prep", 2.0)
-    cook_w = config.get("ease_weights", {}).get("cook", 0.5)
+    if not method_str or not method_str.strip():
+        return 0
+    items = [s for s in method_str.split("|") if s.strip()]
+    if len(items) > 1:
+        return len(items)
+    sentences = re.split(r"(?<=[.!?])\s+", method_str.strip())
+    return len([s for s in sentences if s.strip()])
+
+
+def piecewise_ease(value: float, anchors: list) -> float:
+    """
+    Linear interpolation through a set of fixed (x, ease) anchor points,
+    e.g. [[0, 1.0], [20, 0.85], [45, 0.5], [90, 0.15]] for prep minutes.
+    Clamps to the first/last anchor's ease value outside the given range.
+    Anchors are absolute, fixed thresholds — NOT relative to the recipe
+    pool — so a recipe's ease doesn't shift just because other recipes are
+    added or removed later.
+    """
+    if not anchors:
+        return 0.5
+    anchors = sorted(anchors, key=lambda p: p[0])
+    if value <= anchors[0][0]:
+        return anchors[0][1]
+    if value >= anchors[-1][0]:
+        return anchors[-1][1]
+    for (x0, y0), (x1, y1) in zip(anchors, anchors[1:]):
+        if x0 <= value <= x1:
+            frac = (value - x0) / (x1 - x0) if x1 != x0 else 0.0
+            return y0 + frac * (y1 - y0)
+    return anchors[-1][1]
+
+
+def compute_ease(
+    prep_str: str, cook_str: str, ingredients_str: str, method_str: str,
+    config: dict, total_str: str = "",
+) -> float:
+    """
+    Derive an ease score (0.0 hard → 1.0 easy) from up to five signals: prep
+    time, cook time, total time, ingredient count, and step count. Each
+    signal is mapped through its own fixed piecewise curve (config:
+    ease_curves), then combined with weights (config: ease_weights).
+    Missing signals are simply excluded from the weighted average rather
+    than penalised.
+
+    total_time is only used when prep_time and cook_time aren't BOTH
+    available — some sites (e.g. HelloFresh) only publish a combined total
+    time rather than the two separately. Using it alongside prep/cook when
+    both of those are already present would double-count the same effort.
+
+    Fixed absolute thresholds are used deliberately (not pool-relative
+    percentile ranking) — a 25-minute prep should always read as "quick",
+    regardless of what else is in the recipe database at the time.
+    """
+    curves = config.get("ease_curves", {})
+    weights = config.get("ease_weights", {})
     fallback = config.get("ease_fallback", 0.5)
 
     prep_mins = parse_minutes(prep_str)
     cook_mins = parse_minutes(cook_str)
+    total_mins = parse_minutes(total_str)
+    ing_count = count_ingredients(ingredients_str)
+    step_count = count_steps(method_str)
 
-    if prep_mins is None and cook_mins is None:
+    components = {}
+    if prep_mins is not None and curves.get("prep_minutes"):
+        components["prep"] = piecewise_ease(prep_mins, curves["prep_minutes"])
+    if cook_mins is not None and curves.get("cook_minutes"):
+        components["cook"] = piecewise_ease(cook_mins, curves["cook_minutes"])
+    if (prep_mins is None or cook_mins is None) and total_mins is not None and curves.get("total_minutes"):
+        components["total"] = piecewise_ease(total_mins, curves["total_minutes"])
+    if ing_count > 0 and curves.get("ingredient_count"):
+        components["ingredients"] = piecewise_ease(ing_count, curves["ingredient_count"])
+    if step_count > 0 and curves.get("step_count"):
+        components["steps"] = piecewise_ease(step_count, curves["step_count"])
+
+    if not components:
         return fallback
 
-    effort = ((prep_mins or 0) * prep_w) + ((cook_mins or 0) * cook_w)
-    # log scale: effort=0→log(2)≈0.69, effort=15→log(17)≈2.83, effort=240→log(242)≈5.49
-    # We invert so more effort = lower ease, normalised roughly to 0–1
-    # Using log(effort+2) mapped from [log(2), log(482)] → [1, 0]
-    log_val = math.log(effort + 2)
-    log_min = math.log(2)        # ~0 effort
-    log_max = math.log(482)      # ~240 min prep equivalent (4h)
-    ease = 1.0 - (log_val - log_min) / (log_max - log_min)
+    total_weight = sum(weights.get(k, 1.0) for k in components)
+    if total_weight <= 0:
+        return fallback
+
+    weighted_sum = sum(components[k] * weights.get(k, 1.0) for k in components)
+    ease = weighted_sum / total_weight
     return round(max(0.0, min(1.0, ease)), 4)
+
+
+def recompute_all_ease(output_path: Path, config: dict) -> None:
+    """
+    Recompute the ease column for every row in the processed CSV using the
+    current curves/weights in config.yaml — including rows processed long
+    ago under an older formula. No Ollama calls involved, so this is cheap
+    to run every time and lets you tune ease_curves/ease_weights and see
+    the effect immediately without reprocessing tags.
+    """
+    if not output_path.exists():
+        return
+    with output_path.open(encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return
+    for row in rows:
+        row["ease"] = compute_ease(
+            row.get("prep_time", ""), row.get("cook_time", ""),
+            row.get("ingredients_original", ""), row.get("method", ""),
+            config, total_str=row.get("total_time", ""),
+        )
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_HEADERS)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Recomputed ease for {len(rows)} recipe(s) using current ease_curves/ease_weights.")
 
 
 # ---------------------------------------------------------------------------
@@ -241,14 +340,16 @@ Return exactly this JSON structure:
   "meal_type": "<one of: {meal_types}>",
   "key_ingredients": ["ingredient1", "ingredient2"],
   "cuisine_tags": ["tag1", "tag2"],
+  "diet_type": "<one of: meat, fish, vegetarian, vegan>",
   "season": ["<one or more of: {seasons}>"]
 }}
 
 Rules:
 - meal_type: must be one of the listed values. A chilli is a main. A brownie is a dessert.
-- key_ingredients: the distinctive, characterful ingredients in this dish. Do NOT include: {common_ingredients}. Max 8 items, lowercase, no quantities. Think: what makes this dish what it is?
-- Use categories for the key_ingredients, e.g. "chicken", "beef", "pork", "fish", "tofu", "cheese", "pasta", "rice", "potato", "beans", "lentils". Avoid overly specific terms like "macaroni", "mashed potato".
-- cuisine_tags: include BOTH the cuisine origin AND the dish format where relevant. Examples: ["Mexican", "chilli"] or ["Italian", "pasta", "vegetarian"] or ["British", "bake"]. Max 6 items.
+- key_ingredients: the distinctive, characterful ingredients in this dish. Do NOT include: {common_ingredients}, herbs, spices (including chilli) etc or the word 'vegetable'. Max 4 items, lowercase, no quantities, singular form (tomato rather than tomatoes, courgette rather than courgettes). Think: what makes this dish what it is? Typically this will be the main protein/s and carbohydrate/s. Do not include vegetables unless they are the main feature of the dish (eg "tomato" for a tomato soup). 
+- key_ingredients: Use categories, e.g. "chicken", "beef", "pork", "fish", "tofu", "cheese", "pasta", "rice", "potato", "bean", "lentil". Do not use specific terms, examples here in the form "specific item":"generic term", "macaroni":"pasta", "mashed potato":"potato", "spaghetti":"pasta", "parmesan":"cheese", "cheddar":"cheese", "hallumi":"cheese", "black beans":"bean", "vegan mince":"mince", "vegetarian mince":"mince". Do not include accompaniments like "mango chutney", "salsa", "sour cream" etc.
+- cuisine_tags: include BOTH the cuisine origin AND the dish format where relevant. Examples: ["Mexican", "chilli"] or ["Italian", "pasta"] or ["British", "bake"]. Max 6 items.
+- diet_type: one and only one of ["meat", "fish", "vegetarian", "vegan"]
 - season: which seasons suit this dish. A chilli or stew suits Autumn/Winter. A salad suits Spring/Summer. Use "All" only if it genuinely works year-round.
 """
 
@@ -286,6 +387,11 @@ def validate_tags(raw: dict, config: dict) -> dict:
     meal_type = (raw.get("meal_type") or "").lower().strip()
     if meal_type not in valid_meal_types:
         meal_type = "main"
+    
+    diet_type = (raw.get("diet_type") or "").lower().strip()
+    if diet_type not in ["meat", "fish", "vegetarian", "vegan"]:
+        diet_type = ["meat"]  # Default to meat if not specified
+    else: diet_type = [diet_type]
 
     key_ingredients = [str(i).lower().strip() for i in (raw.get("key_ingredients") or [])][:8]
     cuisine_tags = [str(t).strip() for t in (raw.get("cuisine_tags") or [])][:6]
@@ -300,6 +406,7 @@ def validate_tags(raw: dict, config: dict) -> dict:
         "key_ingredients": key_ingredients,
         "cuisine_tags": cuisine_tags,
         "season": season,
+        "diet_type": diet_type
     }
 
 
@@ -312,6 +419,7 @@ def tag_recipe(recipe: dict, config: dict) -> dict:
         meal_types=", ".join(config.get("meal_types", [])),
         seasons=", ".join(config.get("seasons", [])),
         common_ingredients=", ".join(config.get("common_ingredients", [])),
+        diet_types=", ".join(config.get("diet_types", []))
     )
     try:
         raw_text = call_ollama(prompt, config)
@@ -329,7 +437,7 @@ def tag_recipe(recipe: dict, config: dict) -> dict:
 
 
 def _empty_tags() -> dict:
-    return {"meal_type": "", "key_ingredients": [], "cuisine_tags": [], "season": []}
+    return {"meal_type": "", "key_ingredients": [], "cuisine_tags": [], "season": [], "diet_type": []}
 
 
 # ---------------------------------------------------------------------------
@@ -344,8 +452,12 @@ def process_recipe(recipe: dict, config: dict) -> dict:
     tags = tag_recipe(recipe, config)
     meal_type = tags["meal_type"]
 
-    # Ease from time
-    ease = compute_ease(recipe.get("prep_time", ""), recipe.get("cook_time", ""), config)
+    # Ease from prep/cook/total time + ingredient count + step count
+    ease = compute_ease(
+        recipe.get("prep_time", ""), recipe.get("cook_time", ""),
+        recipe.get("ingredients", ""), recipe.get("method", ""),
+        config, total_str=recipe.get("total_time", ""),
+    )
 
     # Scaling — mains only
     servings_original_str = recipe.get("servings", "").strip()
@@ -370,6 +482,7 @@ def process_recipe(recipe: dict, config: dict) -> dict:
         "scaling_warnings": " | ".join(warnings),
         "prep_time": recipe.get("prep_time", ""),
         "cook_time": recipe.get("cook_time", ""),
+        "total_time": recipe.get("total_time", ""),
         "ease": ease,
         "ingredients_original": ingredients_original,
         "ingredients_scaled": ingredients_scaled,
@@ -378,6 +491,7 @@ def process_recipe(recipe: dict, config: dict) -> dict:
         "scraped_date": recipe.get("scraped_date", ""),
         "tags_key_ingredients": " | ".join(tags["key_ingredients"]),
         "tags_cuisine": " | ".join(tags["cuisine_tags"]),
+        "tags_diet": " | ".join(tags["diet_type"]),
         "tags_season": " | ".join(tags["season"]),
     }
 
@@ -419,27 +533,34 @@ def main() -> None:
 
     skipped = len(recipes) - len(to_process)
     if skipped:
-        print(f"Skipping {skipped} already-processed recipe(s).\n")
+        print(f"Skipping {skipped} already-processed recipe(s) for tagging.\n")
+
     if not to_process:
-        print("Nothing new to process.")
-        return
+        print("Nothing new to tag.")
+    else:
+        print(f"Processing {len(to_process)} recipe(s)...\n")
+        for i, recipe in enumerate(to_process, 1):
+            name = recipe.get("name") or recipe.get("source_url") or f"Row {i}"
+            print(f"[{i}/{len(to_process)}] {name}")
+            try:
+                row = process_recipe(recipe, config)
+                #print(row)
+                append_output_csv(output_path, row)
+                print(f"    ✓ meal_type={row['meal_type']}  key ingredients={row['tags_key_ingredients']}  diet_type={row['tags_diet']}")
+                if row["scaling_warnings"]:
+                    print(f"    ⚠ Scaling warnings: {row['scaling_warnings']}")
+            except Exception as e:
+                print(f"    ✗ Failed: {e}")
+            print()
 
-    print(f"Processing {len(to_process)} recipe(s)...\n")
-    for i, recipe in enumerate(to_process, 1):
-        name = recipe.get("name") or recipe.get("source_url") or f"Row {i}"
-        print(f"[{i}/{len(to_process)}] {name}")
-        try:
-            row = process_recipe(recipe, config)
-            append_output_csv(output_path, row)
-            print(f"    ✓ meal_type={row['meal_type']}  ease={row['ease']}  "
-                  f"scale={row['scale_factor']}x  seasons={row['tags_season']}")
-            if row["scaling_warnings"]:
-                print(f"    ⚠ Scaling warnings: {row['scaling_warnings']}")
-        except Exception as e:
-            print(f"    ✗ Failed: {e}")
-        print()
+    # Ease uses fixed, absolute thresholds (not pool-relative), so this is
+    # just a cheap backfill — no Ollama calls — that lets tuning
+    # ease_curves/ease_weights in config.yaml take effect on every recipe,
+    # including ones tagged long ago, without a full --all reprocess.
+    print("Recomputing ease for all recipes...")
+    recompute_all_ease(output_path, config)
 
-    print(f"Complete. Results in: {output_path.resolve()}")
+    print(f"\nComplete. Results in: {output_path.resolve()}")
 
 
 if __name__ == "__main__":
