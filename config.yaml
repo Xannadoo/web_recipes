@@ -153,7 +153,7 @@ non_vegetarian_keywords:
 # Sites the crawler knows how to discover recipes from.
 # Add more entries here to extend to new sites later.
 sites:
-  - name: "BBC Food"
+  - name: "BBCFood"
     base_url: "https://www.bbc.co.uk"
     sitemap_url: "https://www.bbc.co.uk/food/sitemap.xml"  # unconfirmed — verify this exists before relying on it
     recipe_url_contains: "/food/recipes/"
@@ -170,7 +170,7 @@ sites:
       - "/cuisines/"
       - "/diets/"
     category_urls:
-      main: "https://www.bbc.co.uk/food/collections/affordable_30-minute_meals_for_four"
+      main: "https://www.bbc.co.uk/food/recipes"
       vegetarian: "https://www.bbc.co.uk/food/collections/veggie_family_favourites"
 
   - name: "HelloFresh"
